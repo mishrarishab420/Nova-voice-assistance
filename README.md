@@ -33,7 +33,7 @@ A **cross-platform intelligent voice assistant** that works on both Windows and 
 ### Steps
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/yourusername/nova-voice-assistant.git
+   git clone https://github.com/yourusername/Nova-voice-assistant.git
    cd nova-voice-assistant
 
 2. **Install dependencies:**
