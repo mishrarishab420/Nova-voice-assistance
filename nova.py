@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pygame.pkgdata")
+
 import os
 import sys
 import time
@@ -20,10 +23,13 @@ from bs4 import BeautifulSoup
 from pygame import mixer
 from threading import Thread
 from configparser import ConfigParser
+from gtts import gTTS  # For macOS compatible TTS
+import tempfile  # For temporary audio files
+
 
 # Configuration
 config = ConfigParser()
-config.read('nova_config.ini')
+config.read('config.ini')
 
 # Constants
 WAKE_WORDS = ['hey nova', 'nova']
@@ -36,22 +42,36 @@ IS_MAC = platform.system() == 'Darwin'
 
 class NovaVoiceAssistant:
     def __init__(self):
-        # Initialize speech engine
-        self.engine = pyttsx3.init()
+        # Initialize speech components
+        if IS_MAC:
+            # macOS native speech doesn't need initialization
+            self.speech_engine = 'macos_say'
+        else:
+            try:
+                self.engine = pyttsx3.init()
+                self.speech_engine = 'pyttsx3'
+                self.set_voice_properties()
+            except Exception as e:
+                print(f"pyttsx3 initialization failed: {e}")
+                self.speech_engine = 'gtts'  # Fallback to gTTS
+        
+        # Initialize speech recognition
         self.recognizer = sr.Recognizer()
         self.microphone = sr.Microphone()
         
-        # Set voice properties
-        self.set_voice_properties()
+        # Adjust for ambient noise
+        with self.microphone as source:
+            print("Calibrating microphone...")
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+            
+        # Initialize audio mixer
+        mixer.init()
         
         # State variables
         self.listening = False
         self.last_command_time = time.time()
         self.command_timeout = 30  # seconds
         self.volume = 0.7  # Default volume (0.0 to 1.0)
-        
-        # Initialize mixer for audio playback
-        mixer.init()
         
         # Error responses variety
         self.error_responses = [
@@ -76,26 +96,27 @@ class NovaVoiceAssistant:
         
     def set_voice_properties(self):
         """Set the voice properties for the assistant."""
-        voices = self.engine.getProperty('voices')
-        
-        # Set US English female voice if available
-        for voice in voices:
-            if 'english_us' in voice.id.lower() or 'english' in voice.id.lower() and 'female' in voice.id.lower():
-                self.engine.setProperty('voice', voice.id)
-                self.engine.setProperty('rate', 150)  # Speed percent
-                self.engine.setProperty('volume', self.volume)
-                break
-        
-        # If no US English female found, use first available English voice
-        else:
+        if hasattr(self, 'engine'):
+            voices = self.engine.getProperty('voices')
+            
+            # Set US English female voice if available
             for voice in voices:
-                if 'english' in voice.id.lower():
+                if 'english_us' in voice.id.lower() or 'english' in voice.id.lower() and 'female' in voice.id.lower():
                     self.engine.setProperty('voice', voice.id)
+                    self.engine.setProperty('rate', 150)  # Speed percent
+                    self.engine.setProperty('volume', self.volume)
                     break
+            
+            # If no US English female found, use first available English voice
+            else:
+                for voice in voices:
+                    if 'english' in voice.id.lower():
+                        self.engine.setProperty('voice', voice.id)
+                        break
     
     def create_data_directories(self):
         """Create necessary directories for data storage."""
-        directories = ['data/notes', 'data/reminders', 'data/alarms']
+        directories = ['data/notes', 'data/reminders', 'data/alarms', 'data/music']
         for directory in directories:
             if not os.path.exists(directory):
                 os.makedirs(directory)
@@ -113,25 +134,31 @@ class NovaVoiceAssistant:
                 'word': 'winword.exe',
                 'excel': 'excel.exe',
                 'powerpoint': 'powerpnt.exe',
-                'chrome': 'chrome.exe',
-                'firefox': 'firefox.exe',
+                'chrome': os.path.expandvars('%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe'),
+                'firefox': os.path.expandvars('%ProgramFiles%\\Mozilla Firefox\\firefox.exe'),
                 'edge': 'msedge.exe'
             })
             
             # Try to find actual paths for common applications
             common_paths = {
                 'chrome': [
-                    'C:/Program Files/Google/Chrome/Application/chrome.exe',
-                    'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'
+                    os.path.expandvars('%ProgramFiles%\\Google\\Chrome\\Application\\chrome.exe'),
+                    os.path.expandvars('%ProgramFiles(x86)%\\Google\\Chrome\\Application\\chrome.exe')
                 ],
                 'spotify': [
-                    f'C:/Users/{os.getlogin()}/AppData/Roaming/Spotify/Spotify.exe',
-                    'C:/Program Files/Spotify/Spotify.exe'
+                    os.path.expandvars('%APPDATA%\\Spotify\\Spotify.exe'),
+                    os.path.expandvars('%ProgramFiles%\\Spotify\\Spotify.exe')
                 ],
                 'whatsapp': [
-                    f'C:/Users/{os.getlogin()}/AppData/Local/WhatsApp/WhatsApp.exe'
+                    os.path.expandvars('%LOCALAPPDATA%\\WhatsApp\\WhatsApp.exe')
                 ]
             }
+            
+            for app, paths in common_paths.items():
+                for path in paths:
+                    if os.path.exists(path):
+                        self.system_paths[app] = path
+                        break
             
         elif IS_MAC:
             self.system_paths.update({
@@ -142,31 +169,36 @@ class NovaVoiceAssistant:
                 'firefox': 'open -a Firefox',
                 'safari': 'open -a Safari',
                 'spotify': 'open -a Spotify',
-                'whatsapp': 'open -a WhatsApp'
+                'whatsapp': 'open -a WhatsApp',
+                'mail': 'open -a Mail',
+                'messages': 'open -a Messages'
             })
-        
-        for app, paths in common_paths.items() if IS_WINDOWS else {}:
-            for path in paths:
-                if os.path.exists(path):
-                    self.system_paths[app] = path
-                    break
     
-    def speak(self, text, language='english'):
-        """Convert text to speech with the selected voice."""
-        if language.lower() == 'hindi':
-            # Try to set Hindi voice if available
-            voices = self.engine.getProperty('voices')
-            for voice in voices:
-                if 'hindi' in voice.id.lower() or 'india' in voice.id.lower():
-                    self.engine.setProperty('voice', voice.id)
-                    break
-        
-        self.engine.say(text)
-        self.engine.runAndWait()
-        
-        # Reset to default voice after speaking in Hindi
-        if language.lower() == 'hindi':
-            self.set_voice_properties()
+    def speak(self, text, language='en'):
+        """Cross-platform text-to-speech implementation"""
+        try:
+            if IS_MAC and self.speech_engine == 'macos_say':
+                # Use macOS native say command
+                os.system(f'say "{text}"')
+            elif self.speech_engine == 'pyttsx3' and hasattr(self, 'engine'):
+                # Use pyttsx3 for Windows
+                self.engine.say(text)
+                self.engine.runAndWait()
+            else:
+                # Use gTTS as fallback
+                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=True) as fp:
+                    tts = gTTS(text=text, lang=language)
+                    tts.save(fp.name)
+                    if mixer.get_init() is None:
+                        mixer.init()
+                    mixer.music.load(fp.name)
+                    mixer.music.play()
+                    while mixer.music.get_busy():
+                        time.sleep(0.1)
+        except Exception as e:
+            print(f"Speech error: {e}")
+            # Fallback to printing if speech fails
+            print(f"Assistant: {text}")
     
     def listen(self):
         """Listen for audio input and return recognized text."""
@@ -220,9 +252,9 @@ class NovaVoiceAssistant:
         self.last_command_time = time.time()
         
         # System commands
-        if 'open' in command:
+        if any(word in command for word in ['open', 'launch', 'start']):
             self.open_application(command)
-        elif 'close' in command or 'exit' in command or 'quit' in command:
+        elif any(word in command for word in ['close', 'exit', 'quit', 'stop']):
             self.close_application(command)
         elif 'search' in command:
             self.search_web(command)
@@ -238,7 +270,7 @@ class NovaVoiceAssistant:
             self.get_date()
         elif 'joke' in command:
             self.tell_joke()
-        elif 'note' in command or 'remember' in command:
+        elif any(word in command for word in ['note', 'remember', 'write down']):
             self.take_note(command)
         elif 'reminder' in command:
             self.set_reminder(command)
@@ -250,33 +282,38 @@ class NovaVoiceAssistant:
             self.adjust_brightness(command)
         elif 'screenshot' in command:
             self.take_screenshot()
-        elif 'play music' in command or 'play song' in command:
+        elif any(phrase in command for phrase in ['play music', 'play song', 'play some music']):
             self.play_music()
-        elif 'pause music' in command or 'stop music' in command:
+        elif any(phrase in command for phrase in ['pause music', 'stop music', 'pause the music']):
             self.pause_music()
         elif 'next song' in command:
             self.next_song()
-        elif 'shutdown' in command or 'shut down' in command:
+        elif any(phrase in command for phrase in ['shutdown', 'shut down', 'turn off computer']):
             self.shutdown_system()
         elif 'restart' in command:
             self.restart_system()
-        elif 'sleep' in command:
+        elif any(phrase in command for phrase in ['sleep', 'put to sleep']):
             self.sleep_system()
-        elif 'lock' in command:
+        elif any(phrase in command for phrase in ['lock', 'lock computer', 'lock screen']):
             self.lock_system()
         elif 'who are you' in command:
             self.speak("I'm Nova, your personal voice assistant. I'm here to help you with various tasks.")
         elif 'how are you' in command:
             self.speak("I'm functioning optimally, thank you for asking. How can I assist you?")
-        elif 'thank you' in command:
+        elif any(phrase in command for phrase in ['thank you', 'thanks']):
             responses = ["You're welcome!", "My pleasure!", "Happy to help!", "Anytime!"]
             self.speak(random.choice(responses))
         elif 'your name' in command:
             self.speak("My name is Nova. I'm your voice assistant.")
-        elif 'change language' in command or 'hindi' in command:
+        elif any(phrase in command for phrase in ['change language', 'hindi', 'switch to hindi']):
             self.change_language(command)
-        elif 'what can you do' in command:
+        elif any(phrase in command for phrase in ['what can you do', 'your capabilities', 'help']):
             self.list_capabilities()
+        elif any(phrase in command for phrase in ['exit', 'goodbye', 'bye', 'see you later']):
+            self.speak("Goodbye! Have a great day.")
+            sys.exit(0)
+        elif 'math' in command or 'calculate' in command:
+            self.solve_math(command)
         else:
             self.speak(random.choice(self.error_responses))
             return False
@@ -290,21 +327,28 @@ class NovaVoiceAssistant:
             'calculator': 'calculator',
             'paint': 'paint',
             'command prompt': 'cmd',
+            'terminal': 'terminal',
             'word': 'word',
             'excel': 'excel',
             'powerpoint': 'powerpoint',
             'chrome': 'chrome',
             'firefox': 'firefox',
             'edge': 'edge',
+            'safari': 'safari',
             'spotify': 'spotify',
-            'whatsapp': 'whatsapp'
+            'whatsapp': 'whatsapp',
+            'mail': 'mail',
+            'messages': 'messages'
         }
         
         for app_name, app_key in apps.items():
             if app_name in command:
                 if app_key in self.system_paths:
                     try:
-                        subprocess.Popen(self.system_paths[app_key])
+                        if IS_MAC and isinstance(self.system_paths[app_key], str) and self.system_paths[app_key].startswith('open -a'):
+                            subprocess.Popen(self.system_paths[app_key], shell=True)
+                        else:
+                            subprocess.Popen(self.system_paths[app_key])
                         self.speak(f"Opening {app_name}")
                     except Exception as e:
                         self.speak(f"Sorry, I couldn't open {app_name}. Error: {str(e)}")
@@ -334,7 +378,7 @@ class NovaVoiceAssistant:
             
             # If no known website, try to extract a URL
             try:
-                url_start = command.find('open') + 4
+                url_start = command.find('open') + 4 if 'open' in command else command.find('website') + 7
                 url = command[url_start:].strip()
                 if '.' not in url:
                     url += '.com'
@@ -355,12 +399,14 @@ class NovaVoiceAssistant:
             'calculator': 'calculator.exe',
             'paint': 'mspaint.exe',
             'command prompt': 'cmd.exe',
+            'terminal': 'Terminal',
             'word': 'winword.exe',
             'excel': 'excel.exe',
             'powerpoint': 'powerpnt.exe',
             'chrome': 'chrome.exe',
             'firefox': 'firefox.exe',
             'edge': 'msedge.exe',
+            'safari': 'Safari',
             'spotify': 'spotify.exe',
             'whatsapp': 'whatsapp.exe'
         }
@@ -368,7 +414,10 @@ class NovaVoiceAssistant:
         for app_name, process_name in apps.items():
             if app_name in command:
                 try:
-                    os.system(f'taskkill /f /im {process_name}')
+                    if IS_WINDOWS:
+                        os.system(f'taskkill /f /im {process_name}')
+                    elif IS_MAC:
+                        os.system(f'pkill -f {process_name}')
                     self.speak(f"Closing {app_name}")
                 except Exception as e:
                     self.speak(f"Sorry, I couldn't close {app_name}. Error: {str(e)}")
@@ -415,7 +464,7 @@ class NovaVoiceAssistant:
     def get_weather(self, command):
         """Get weather information for a location."""
         if not WEATHER_API_KEY:
-            self.speak("Weather functionality is not configured. Please set up an API key.")
+            self.speak("Weather functionality is not configured. Please set up an API key in the config file.")
             return
         
         location_start = command.find('weather in') + 10 if 'weather in' in command else command.find('weather') + 7
@@ -454,7 +503,7 @@ class NovaVoiceAssistant:
     def get_news(self, command):
         """Get the latest news headlines."""
         if not NEWS_API_KEY:
-            self.speak("News functionality is not configured. Please set up an API key.")
+            self.speak("News functionality is not configured. Please set up an API key in the config file.")
             return
         
         try:
@@ -514,55 +563,166 @@ class NovaVoiceAssistant:
     
     def set_reminder(self, command):
         """Set a reminder for a specific time."""
-        # This would require more complex natural language processing
-        # For now, just acknowledge the request
-        self.speak("I'll remind you about that. Please set a specific time for the reminder.")
+        # Extract time and reminder text from command
+        self.speak("Please tell me the time and what you want to be reminded about.")
+        reminder_details = self.listen()
+        
+        if reminder_details:
+            try:
+                # Simple parsing - in a real app you'd use more sophisticated NLP
+                time_match = re.search(r'(\d{1,2}):?(\d{2})?\s?(am|pm)?', reminder_details, re.IGNORECASE)
+                if time_match:
+                    hour = int(time_match.group(1))
+                    minute = int(time_match.group(2)) if time_match.group(2) else 0
+                    period = time_match.group(3).lower() if time_match.group(3) else 'am'
+                    
+                    if period == 'pm' and hour < 12:
+                        hour += 12
+                    elif period == 'am' and hour == 12:
+                        hour = 0
+                    
+                    # Get current time
+                    now = datetime.datetime.now()
+                    reminder_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    
+                    # If the time has already passed today, set for tomorrow
+                    if reminder_time < now:
+                        reminder_time += datetime.timedelta(days=1)
+                    
+                    # Extract reminder text
+                    reminder_text = re.sub(r'(\d{1,2}):?(\d{2})?\s?(am|pm)?', '', reminder_details, flags=re.IGNORECASE).strip()
+                    
+                    # Save reminder
+                    timestamp = reminder_time.strftime("%Y-%m-%d_%H-%M-%S")
+                    reminder_filename = f"data/reminders/reminder_{timestamp}.txt"
+                    
+                    with open(reminder_filename, 'w') as reminder_file:
+                        reminder_file.write(reminder_text)
+                    
+                    self.speak(f"I'll remind you to {reminder_text} at {reminder_time.strftime('%I:%M %p')}")
+                else:
+                    self.speak("I couldn't understand the time. Please try again.")
+            except Exception as e:
+                self.speak(f"Sorry, I couldn't set the reminder. Error: {str(e)}")
+        else:
+            self.speak("I didn't hear the reminder details. Please try again.")
     
     def set_alarm(self, command):
         """Set an alarm for a specific time."""
-        # This would require more complex natural language processing
-        # For now, just acknowledge the request
-        self.speak("I'll set an alarm for you. Please specify the exact time for the alarm.")
+        self.speak("Please tell me the time for the alarm.")
+        alarm_time = self.listen()
+        
+        if alarm_time:
+            try:
+                # Simple parsing - in a real app you'd use more sophisticated NLP
+                time_match = re.search(r'(\d{1,2}):?(\d{2})?\s?(am|pm)?', alarm_time, re.IGNORECASE)
+                if time_match:
+                    hour = int(time_match.group(1))
+                    minute = int(time_match.group(2)) if time_match.group(2) else 0
+                    period = time_match.group(3).lower() if time_match.group(3) else 'am'
+                    
+                    if period == 'pm' and hour < 12:
+                        hour += 12
+                    elif period == 'am' and hour == 12:
+                        hour = 0
+                    
+                    # Get current time
+                    now = datetime.datetime.now()
+                    alarm_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    
+                    # If the time has already passed today, set for tomorrow
+                    if alarm_time < now:
+                        alarm_time += datetime.timedelta(days=1)
+                    
+                    # Calculate time difference
+                    time_diff = (alarm_time - now).total_seconds()
+                    
+                    # Save alarm
+                    timestamp = alarm_time.strftime("%Y-%m-%d_%H-%M-%S")
+                    alarm_filename = f"data/alarms/alarm_{timestamp}.txt"
+                    
+                    with open(alarm_filename, 'w') as alarm_file:
+                        alarm_file.write("Alarm set by user")
+                    
+                    # Start alarm thread
+                    Thread(target=self._alarm_thread, args=(time_diff,)).start()
+                    
+                    self.speak(f"Alarm set for {alarm_time.strftime('%I:%M %p')}")
+                else:
+                    self.speak("I couldn't understand the time. Please try again.")
+            except Exception as e:
+                self.speak(f"Sorry, I couldn't set the alarm. Error: {str(e)}")
+        else:
+            self.speak("I didn't hear the alarm time. Please try again.")
+    
+    def _alarm_thread(self, delay):
+        """Thread function for alarm countdown."""
+        time.sleep(delay)
+        self.speak("Alarm! Alarm! Wake up!")
+        # Play alarm sound
+        try:
+            mixer.music.load('data/alarms/alarm_sound.mp3')  # You need to provide this file
+            mixer.music.play()
+        except:
+            pass
     
     def adjust_volume(self, command):
         """Adjust the system volume."""
         if 'increase' in command or 'up' in command:
             self.volume = min(1.0, self.volume + 0.1)
-            self.engine.setProperty('volume', self.volume)
+            if hasattr(self, 'engine'):
+                self.engine.setProperty('volume', self.volume)
             self.speak(f"Volume increased to {int(self.volume * 100)} percent")
         elif 'decrease' in command or 'down' in command:
             self.volume = max(0.0, self.volume - 0.1)
-            self.engine.setProperty('volume', self.volume)
+            if hasattr(self, 'engine'):
+                self.engine.setProperty('volume', self.volume)
             self.speak(f"Volume decreased to {int(self.volume * 100)} percent")
         elif 'mute' in command or 'silent' in command:
             self.volume = 0.0
-            self.engine.setProperty('volume', self.volume)
+            if hasattr(self, 'engine'):
+                self.engine.setProperty('volume', self.volume)
             self.speak("Volume muted")
         elif 'unmute' in command or 'sound on' in command:
             self.volume = 0.7
-            self.engine.setProperty('volume', self.volume)
+            if hasattr(self, 'engine'):
+                self.engine.setProperty('volume', self.volume)
             self.speak("Volume unmuted")
         else:
             self.speak(f"Current volume is set to {int(self.volume * 100)} percent")
     
     def adjust_brightness(self, command):
-        """Adjust the screen brightness (Windows only)."""
+        """Adjust the screen brightness."""
         try:
-            if 'increase' in command or 'up' in command:
-                # This would require additional libraries or Windows API calls
-                self.speak("Increasing screen brightness")
-            elif 'decrease' in command or 'down' in command:
-                self.speak("Decreasing screen brightness")
-            else:
-                self.speak("Current brightness level cannot be determined")
+            if IS_WINDOWS:
+                if 'increase' in command or 'up' in command:
+                    # Windows brightness control requires additional libraries
+                    self.speak("Increasing screen brightness")
+                elif 'decrease' in command or 'down' in command:
+                    self.speak("Decreasing screen brightness")
+                else:
+                    self.speak("Current brightness level cannot be determined")
+            elif IS_MAC:
+                if 'increase' in command or 'up' in command:
+                    os.system("brightness 0.8")  # Set to 80%
+                    self.speak("Increased screen brightness")
+                elif 'decrease' in command or 'down' in command:
+                    os.system("brightness 0.4")  # Set to 40%
+                    self.speak("Decreased screen brightness")
+                else:
+                    self.speak("Current brightness level cannot be determined")
         except:
             self.speak("Sorry, I can't adjust brightness on this system.")
     
     def take_screenshot(self):
         """Take a screenshot of the current screen."""
         try:
+            screenshots_dir = "data/screenshots"
+            if not os.path.exists(screenshots_dir):
+                os.makedirs(screenshots_dir)
+                
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            screenshot_filename = f"screenshot_{timestamp}.png"
+            screenshot_filename = f"{screenshots_dir}/screenshot_{timestamp}.png"
             pyautogui.screenshot(screenshot_filename)
             self.speak("Screenshot taken and saved")
         except Exception as e:
@@ -574,7 +734,7 @@ class NovaVoiceAssistant:
         if not os.path.exists(music_dir):
             os.makedirs(music_dir)
         
-        music_files = [f for f in os.listdir(music_dir) if f.endswith(('.mp3', '.wav'))]
+        music_files = [f for f in os.listdir(music_dir) if f.endswith(('.mp3', '.wav', '.m4a'))]
         
         if not music_files:
             self.speak("No music files found in the music directory.")
@@ -582,9 +742,12 @@ class NovaVoiceAssistant:
         
         # Play a random song
         song = random.choice(music_files)
-        mixer.music.load(os.path.join(music_dir, song))
-        mixer.music.play()
-        self.speak(f"Playing {os.path.splitext(song)[0]}")
+        try:
+            mixer.music.load(os.path.join(music_dir, song))
+            mixer.music.play()
+            self.speak(f"Playing {os.path.splitext(song)[0]}")
+        except Exception as e:
+            self.speak(f"Sorry, I couldn't play the music. Error: {str(e)}")
     
     def pause_music(self):
         """Pause the currently playing music."""
@@ -602,34 +765,40 @@ class NovaVoiceAssistant:
     def shutdown_system(self):
         """Shutdown the computer."""
         self.speak("Shutting down the system in 10 seconds. Say 'cancel' to abort.")
-        time.sleep(10)
         
-        # Check if user canceled
-        if not self.listening:
-            return
+        # Give user time to cancel
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            if self.listen() and 'cancel' in self.listen():
+                self.speak("Shutdown cancelled.")
+                return
+            time.sleep(1)
         
         try:
-            if os.name == 'nt':  # Windows
+            if IS_WINDOWS:
                 os.system('shutdown /s /t 1')
-            elif os.name == 'posix':  # Linux/Mac
-                os.system('shutdown -h now')
+            elif IS_MAC:
+                os.system('osascript -e \'tell app "System Events" to shut down\'')
         except:
             self.speak("Sorry, I couldn't shutdown the system.")
     
     def restart_system(self):
         """Restart the computer."""
         self.speak("Restarting the system in 10 seconds. Say 'cancel' to abort.")
-        time.sleep(10)
         
-        # Check if user canceled
-        if not self.listening:
-            return
+        # Give user time to cancel
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            if self.listen() and 'cancel' in self.listen():
+                self.speak("Restart cancelled.")
+                return
+            time.sleep(1)
         
         try:
-            if os.name == 'nt':  # Windows
+            if IS_WINDOWS:
                 os.system('shutdown /r /t 1')
-            elif os.name == 'posix':  # Linux/Mac
-                os.system('shutdown -r now')
+            elif IS_MAC:
+                os.system('osascript -e \'tell app "System Events" to restart\'')
         except:
             self.speak("Sorry, I couldn't restart the system.")
     
@@ -637,10 +806,10 @@ class NovaVoiceAssistant:
         """Put the system to sleep."""
         self.speak("Putting the system to sleep.")
         try:
-            if os.name == 'nt':  # Windows
+            if IS_WINDOWS:
                 os.system('rundll32.exe powrprof.dll,SetSuspendState 0,1,0')
-            elif os.name == 'posix':  # Linux/Mac
-                os.system('systemctl suspend')
+            elif IS_MAC:
+                os.system('pmset sleepnow')
         except:
             self.speak("Sorry, I couldn't put the system to sleep.")
     
@@ -648,10 +817,10 @@ class NovaVoiceAssistant:
         """Lock the computer."""
         self.speak("Locking the system.")
         try:
-            if os.name == 'nt':  # Windows
+            if IS_WINDOWS:
                 os.system('rundll32.exe user32.dll,LockWorkStation')
-            elif os.name == 'posix':  # Linux
-                os.system('gnome-screensaver-command -l')
+            elif IS_MAC:
+                os.system('/System/Library/CoreServices/Menu\\ Extras/User.menu/Contents/Resources/CGSession -suspend')
         except:
             self.speak("Sorry, I couldn't lock the system.")
     
@@ -659,7 +828,7 @@ class NovaVoiceAssistant:
         """Change the assistant's language."""
         if 'hindi' in command:
             self.preferred_language = 'hindi'
-            self.speak("भाषा हिंदी में बदल गई है", language='hindi')
+            self.speak("भाषा हिंदी में बदल गई है", language='hi')
         else:
             self.preferred_language = 'english'
             self.speak("Language changed to English")
@@ -679,7 +848,8 @@ class NovaVoiceAssistant:
             "I can take screenshots.",
             "I can play music from your collection.",
             "I can control your system - shutdown, restart, sleep or lock.",
-            "I can switch between English and Hindi languages."
+            "I can switch between English and Hindi languages.",
+            "I can perform math calculations."
         ]
         
         self.speak("Here's what I can do:")
@@ -718,7 +888,7 @@ class NovaVoiceAssistant:
                                 continue
                             
                             # Check if user wants to stop listening
-                            if 'stop listening' in command or 'go to sleep' in command:
+                            if any(phrase in command for phrase in ['stop listening', 'go to sleep', 'that\'s all']):
                                 self.speak("I'll stop listening now. Say 'Hey Nova' to wake me up.")
                                 self.listening = False
                                 break
@@ -740,5 +910,17 @@ class NovaVoiceAssistant:
                 time.sleep(1)
 
 if __name__ == "__main__":
+    # Create default config file if it doesn't exist
+    if not os.path.exists('nova_config.ini'):
+        with open('config.ini', 'w') as f:
+            f.write("""[user]
+name = Rishabh
+language = hindi
+
+[api_keys]
+openweathermap = 07c8d3211d6b0865c09bb0c3e191a0d0
+newsapi = dee28dbc351742f58095e3ad62ac25ce
+""")
+    
     assistant = NovaVoiceAssistant()
     assistant.run()
